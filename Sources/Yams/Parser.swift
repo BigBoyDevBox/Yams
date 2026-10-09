@@ -157,22 +157,42 @@ public final class Parser {
     /// Encoding
     public let encoding: Encoding
 
+    /// Controls duplicate-key comparisons during composition.
+    public enum DuplicateKeyPolicy {
+        /// Check every mapping key for duplicates. This is the default.
+        case checkAll
+        /// Defer comparisons involving any key containing an anchor or alias,
+        /// including anchors in sequence elements and mapping keys or values.
+        /// All remaining keys are still checked against one another.
+        ///
+        /// The caller must reject anchors and aliases in the returned nodes, or
+        /// independently validate the deferred keys, before using those nodes.
+        /// Aliases compose as copies of anchored nodes. Retain the parser while
+        /// inspecting their weak anchor metadata, and check `Node.anchor` before
+        /// descending into children to avoid expanding an alias graph.
+        /// This policy does not bound later hashing, comparison or construction.
+        case deferAnchoredKeys
+    }
+
     /// Set up a `Parser` with a `String` value as input.
     ///
     /// - parameter string: YAML string.
     /// - parameter resolver: Resolver, `.default` if omitted.
     /// - parameter constructor: Constructor, `.default` if omitted.
     /// - parameter encoding: Encoding, `.default` if omitted.
+    /// - parameter duplicateKeyPolicy: Duplicate-key checking policy, `.checkAll` if omitted.
     ///
     /// - throws: `YamlError`.
     public init(yaml string: String,
                 resolver: Resolver = .default,
                 constructor: Constructor = .default,
-                encoding: Encoding = .default) throws {
+                encoding: Encoding = .default,
+                duplicateKeyPolicy: DuplicateKeyPolicy = .checkAll) throws {
         yaml = string
         self.resolver = resolver
         self.constructor = constructor
         self.encoding = encoding
+        self.duplicateKeyPolicy = duplicateKeyPolicy
 
         yaml_parser_initialize(&parser)
         switch encoding {
@@ -205,12 +225,14 @@ public final class Parser {
     /// - parameter resolver: Resolver, `.default` if omitted.
     /// - parameter constructor: Constructor, `.default` if omitted.
     /// - parameter encoding: Encoding, `.default` if omitted.
+    /// - parameter duplicateKeyPolicy: Duplicate-key checking policy, `.checkAll` if omitted.
     ///
     /// - throws: `YamlError`.
     public convenience init(yaml data: Data,
                             resolver: Resolver = .default,
                             constructor: Constructor = .default,
-                            encoding: Encoding = .default) throws {
+                            encoding: Encoding = .default,
+                            duplicateKeyPolicy: DuplicateKeyPolicy = .checkAll) throws {
         guard let yamlString = String(data: data, encoding: encoding.swiftStringEncoding) else {
             throw YamlError.dataCouldNotBeDecoded(encoding: encoding.swiftStringEncoding)
         }
@@ -219,7 +241,8 @@ public final class Parser {
             yaml: yamlString,
             resolver: resolver,
             constructor: constructor,
-            encoding: encoding
+            encoding: encoding,
+            duplicateKeyPolicy: duplicateKeyPolicy
         )
     }
 
@@ -259,6 +282,7 @@ public final class Parser {
 
     // MARK: - Private Members
 
+    private let duplicateKeyPolicy: DuplicateKeyPolicy
     private var _anchorMap = [Anchor: Node]()
     private var _anchorList = [Anchor]()
     private var anchors: [Anchor: Node] { _anchorMap }
@@ -395,7 +419,14 @@ private extension Parser {
     }
 
     private func checkDuplicates(mappingKeys: [Node]) throws {
-        let duplicates: [Node: [Node]] = Dictionary(grouping: mappingKeys) { $0 }.filter { $1.count > 1 }
+        let keys: [Node]
+        switch duplicateKeyPolicy {
+        case .checkAll:
+            keys = mappingKeys
+        case .deferAnchoredKeys:
+            keys = mappingKeys.filter { !containsAnchorOrAlias($0) }
+        }
+        let duplicates: [Node: [Node]] = Dictionary(grouping: keys) { $0 }.filter { $1.count > 1 }
         guard duplicates.isEmpty else {
             let sortedKeys = duplicates.keys.sorted()
             let firstKey = sortedKeys.first!
@@ -404,6 +435,21 @@ private extension Parser {
             throw YamlError.duplicatedKeysInMapping(duplicates: duplicates,
                                                     context: .init(text: yaml,
                                                                    mark: firstMark))
+        }
+    }
+
+    private func containsAnchorOrAlias(_ node: Node) -> Bool {
+        // Aliases share anchored nodes. Stop before visiting that shared subtree.
+        guard node.anchor == nil else { return true }
+        switch node {
+        case .scalar:
+            return false
+        case .alias:
+            return true
+        case .sequence(let sequence):
+            return sequence.contains(where: containsAnchorOrAlias)
+        case .mapping(let mapping):
+            return mapping.contains { containsAnchorOrAlias($0.key) || containsAnchorOrAlias($0.value) }
         }
     }
 
